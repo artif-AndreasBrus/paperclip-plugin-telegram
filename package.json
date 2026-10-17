@@ -1,5 +1,5 @@
 {
-  "name": "paperclip-plugin-telegram",
+  "name": "@artif/paperclip-plugin-telegram",
   "version": "0.8.2-artif.interactions.1",
   "type": "module",
   "main": "./dist/index.js",
