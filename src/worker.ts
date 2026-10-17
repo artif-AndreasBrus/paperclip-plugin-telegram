@@ -25,8 +25,15 @@ import {
   formatAgentError,
   formatAgentRunStarted,
   formatAgentRunFinished,
+  formatIssueInteraction,
   type IssueLinksOpts,
 } from "./formatters.js";
+import {
+  isActionableInteraction,
+  parseInteractionCallbackData,
+  INTERACTION_ENTITY_TYPE,
+  INTERACTION_REASON_ENTITY_TYPE,
+} from "./interaction-routing.js";
 import { handleCommand, resolveNotificationThreadId, BOT_COMMANDS } from "./commands.js";
 import {
   routeMessageToAgent,
@@ -78,6 +85,10 @@ type TelegramConfig = {
   onlyNotifyIfAssignedTo: string;
   notifyOnApprovalCreated: boolean;
   onlyNotifyBoardApprovals: boolean;
+  notifyOnIssueInteraction: boolean;
+  issueInteractionsChatId: string;
+  issueInteractionsTopicId: string;
+  issueInteractionActorUserId: string;
   notifyOnAgentError: boolean;
   notifyOnAgentRunStarted: boolean;
   notifyOnAgentRunFinished: boolean;
@@ -380,7 +391,7 @@ function parseTopicId(value?: string): number | undefined {
 
 function validateConfiguredTopicIds(config: Record<string, unknown>): string[] {
   const errors: string[] = [];
-  for (const key of ["approvalsTopicId", "errorsTopicId", "digestTopicId"]) {
+  for (const key of ["approvalsTopicId", "errorsTopicId", "digestTopicId", "issueInteractionsTopicId"]) {
     const value = config[key];
     if (value === undefined || value === null || value === "") continue;
     if (typeof value !== "string" || !parseTopicId(value)) {
@@ -803,6 +814,87 @@ async function notify(
   }
 }
 
+/**
+ * Discover and notify pending decision cards on an issue.
+ *
+ * Called from issue.created/issue.updated — the host has no dedicated
+ * `interaction.created` event, but posting a decision card to a thread updates
+ * its issue, so listing the issue's interactions on each change catches new
+ * ones. Only still-pending `request_confirmation` cards are actionable from
+ * Telegram (see interaction-routing.ts); everything else is left to the digest.
+ *
+ * `interaction-seen:<id>` dedupes across the many issue.updated events a single
+ * card's lifecycle emits. Best-effort throughout: a decision card that cannot be
+ * delivered must never wedge the event handler or the polling offset.
+ */
+async function checkIssueInteractions(
+  ctx: PluginContext,
+  rt: TelegramRuntime,
+  issueId: string,
+  companyId: string,
+): Promise<void> {
+  if (!rt.config.notifyOnIssueInteraction || !issueId) return;
+
+  let interactions: Awaited<ReturnType<typeof ctx.issues.listInteractions>>;
+  try {
+    interactions = await ctx.issues.listInteractions(issueId, companyId);
+  } catch (err) {
+    ctx.logger.warn("Failed to list issue interactions", { issueId, companyId, error: String(err) });
+    return;
+  }
+
+  const pending = interactions.filter(isActionableInteraction);
+  if (pending.length === 0) return;
+
+  const chatId = await resolveChat(
+    ctx,
+    companyId,
+    rt.config.issueInteractionsChatId || rt.config.approvalsChatId || rt.config.defaultChatId,
+  );
+  if (!chatId) return;
+
+  const linksOpts = await resolveIssueLinksOpts(ctx, rt.publicUrl, companyId);
+  const messageThreadId =
+    parseTopicId(rt.config.issueInteractionsTopicId) ?? parseTopicId(rt.config.approvalsTopicId);
+
+  // Fetch issue metadata once for the whole batch (identifier/title for the link).
+  let issueInfo: { identifier?: string | null; title?: string | null } = {};
+  try {
+    const issue = await ctx.issues.get(issueId, companyId);
+    if (issue) issueInfo = { identifier: issue.identifier, title: issue.title };
+  } catch { /* best effort — the card still sends without the link */ }
+
+  for (const interaction of pending) {
+    const seenKey = `interaction-seen:${interaction.id}`;
+    const alreadySeen = await ctx.state.get({ scopeKind: "instance", stateKey: seenKey });
+    if (alreadySeen) continue;
+
+    const msg = formatIssueInteraction(interaction, issueInfo, linksOpts);
+    if (messageThreadId) msg.options.messageThreadId = messageThreadId;
+
+    const messageId = await sendMessage(ctx, rt.token, chatId, msg.text, msg.options);
+    if (!messageId) continue;
+
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `msg_${chatId}_${messageId}` },
+      {
+        entityId: issueId,
+        entityType: INTERACTION_ENTITY_TYPE,
+        companyId,
+        interactionId: interaction.id,
+        rejectRequiresReason: Boolean(interaction.payload.rejectRequiresReason),
+      },
+    );
+    await ctx.state.set({ scopeKind: "instance", stateKey: seenKey }, { messageId, chatId });
+    await ctx.activity.log({
+      companyId,
+      message: "Forwarded decision card to Telegram",
+      entityType: "plugin",
+      entityId: issueId,
+    });
+  }
+}
+
 const enrichAgentName = async (ctx: PluginContext, event: PluginEvent) => {
   const payload = event.payload as Record<string, unknown>;
   if (payload.agentId && !payload.agentName) {
@@ -974,6 +1066,18 @@ export const plugin = definePlugin({
       }
       await notify(ctx, rt, event, formatApprovalCreated, rt.config.approvalsChatId, rt.config.approvalsTopicId);
     });
+
+    // Decision cards (issue-thread `request_confirmation` interactions). No
+    // dedicated `interaction.created` event exists, so discovery rides on the
+    // issue.created/issue.updated events the card's creation already emits.
+    const onIssueMaybeInteraction = async (event: PluginEvent) => {
+      const rt = ensureRuntime();
+      if (!rt || !rt.config.notifyOnIssueInteraction) return;
+      if (!event.entityId) return;
+      await checkIssueInteractions(ctx, rt, event.entityId, event.companyId);
+    };
+    ctx.events.on("issue.created", onIssueMaybeInteraction);
+    ctx.events.on("issue.updated", onIssueMaybeInteraction);
 
     ctx.events.on("agent.run.failed", async (event: PluginEvent) => {
       const rt = ensureRuntime();
@@ -1463,7 +1567,7 @@ export async function handleUpdate(
   if (update.callback_query) {
     const companyId = await resolveCallbackCompanyId(ctx, update.callback_query);
     const boardApiToken = await resolveBoardApiToken(ctx, config, companyId);
-    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken);
+    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, config.issueInteractionActorUserId);
     return;
   }
 
@@ -1538,9 +1642,42 @@ export async function handleUpdate(
     const mapping = await ctx.state.get({
       scopeKind: "instance",
       stateKey: `msg_${chatId}_${replyToId}`,
-    }) as { entityId: string; entityType: string; companyId: string } | null;
+    }) as {
+      entityId: string;
+      entityType: string;
+      companyId: string;
+      interactionId?: string;
+      cardMessageId?: number;
+    } | null;
 
-    if (mapping && mapping.entityType === "escalation") {
+    if (mapping && mapping.entityType === INTERACTION_REASON_ENTITY_TYPE && mapping.interactionId) {
+      // The reply carries the rejection reason captured by the force-reply
+      // prompt handleInteractionCallback sent. Resolve the card now, editing
+      // the original decision message (not the prompt) to show the outcome.
+      const actorUserId = config.issueInteractionActorUserId;
+      const actorLabel = msg.from?.username ?? msg.from?.first_name ?? String(msg.from?.id ?? chatId);
+      if (!actorUserId) {
+        await sendMessage(ctx, token, chatId, "No board user is configured for decisions.", {
+          replyToMessageId: msg.message_id,
+        });
+      } else {
+        await applyInteractionDecision(
+          ctx,
+          token,
+          {
+            issueId: mapping.entityId,
+            companyId: mapping.companyId,
+            interactionId: mapping.interactionId,
+            chatId,
+            messageId: mapping.cardMessageId ?? replyToId,
+          },
+          "reject",
+          actorUserId,
+          text,
+          actorLabel,
+        );
+      }
+    } else if (mapping && mapping.entityType === "escalation") {
       const escalationManager = new EscalationManager();
       const responderId = `telegram:${msg.from?.username ?? msg.from?.id ?? chatId}`;
       await escalationManager.respond(ctx, token, mapping.entityId, {
@@ -1575,12 +1712,157 @@ export async function handleUpdate(
   }
 }
 
+type InteractionCardRef = {
+  issueId: string;
+  companyId: string;
+  interactionId: string;
+  chatId: string;
+  messageId: number;
+};
+
+/**
+ * Resolve (accept/reject) a decision card and report the outcome.
+ *
+ * `respondInteraction` decides ON BEHALF OF `actorUserId`; the host re-verifies
+ * that user is an active human member before applying, so a missing/invalid
+ * actor fails host-side rather than resolving as the wrong identity. `applied`
+ * is false on an idempotent replay (the card was already resolved) — reported
+ * as such instead of claiming this click did it.
+ */
+async function applyInteractionDecision(
+  ctx: PluginContext,
+  token: string,
+  card: InteractionCardRef,
+  action: "accept" | "reject",
+  actorUserId: string,
+  reason: string | null,
+  actorLabel: string,
+  callbackQueryId?: string,
+): Promise<void> {
+  try {
+    const { applied } = await ctx.issues.respondInteraction(
+      card.issueId,
+      card.interactionId,
+      { action, actorUserId, reason },
+      card.companyId,
+    );
+
+    const icon = action === "accept" ? "✅" : "❌";
+    const verb = action === "accept" ? "Approved" : "Rejected";
+    const suffix = applied ? "" : " (already resolved)";
+    let body = `${escapeMarkdownV2(icon)} *${escapeMarkdownV2(verb + suffix)}* by ${escapeMarkdownV2(actorLabel)}`;
+    if (reason) body += `\n${escapeMarkdownV2(`Reason: ${reason}`)}`;
+
+    await editMessage(ctx, token, card.chatId, card.messageId, body, { parseMode: "MarkdownV2" });
+    if (callbackQueryId) await answerCallbackQuery(ctx, token, callbackQueryId, `${verb}${suffix}`);
+    if (applied) await ctx.metrics.write(METRIC_NAMES.interactionsResolved, 1);
+
+    ctx.logger.info("Resolved issue-thread interaction from Telegram", {
+      interactionId: card.interactionId,
+      issueId: card.issueId,
+      action,
+      applied,
+      actor: actorLabel,
+    });
+  } catch (err) {
+    ctx.logger.error("Failed to resolve issue-thread interaction", {
+      interactionId: card.interactionId,
+      action,
+      error: String(err),
+    });
+    if (callbackQueryId) await answerCallbackQuery(ctx, token, callbackQueryId, `Failed: ${String(err)}`);
+  }
+}
+
+async function handleInteractionCallback(
+  ctx: PluginContext,
+  token: string,
+  query: NonNullable<TelegramUpdate["callback_query"]>,
+  callback: { action: "accept" | "reject"; interactionId: string },
+  actorUserId?: string,
+): Promise<void> {
+  const chatId = query.message?.chat.id ? String(query.message.chat.id) : null;
+  const messageId = query.message?.message_id;
+  const actorLabel = query.from.username ?? query.from.first_name ?? String(query.from.id);
+
+  if (!chatId || !messageId) {
+    await answerCallbackQuery(ctx, token, query.id, "This decision is no longer available");
+    return;
+  }
+
+  const mapping = (await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: `msg_${chatId}_${messageId}`,
+  })) as
+    | { entityId: string; entityType: string; companyId: string; interactionId?: string; rejectRequiresReason?: boolean }
+    | null;
+
+  if (
+    !mapping ||
+    mapping.entityType !== INTERACTION_ENTITY_TYPE ||
+    mapping.interactionId !== callback.interactionId
+  ) {
+    await answerCallbackQuery(ctx, token, query.id, "This decision is no longer available");
+    return;
+  }
+
+  // Responding resolves the card in a human's name — never guess the identity.
+  if (!actorUserId) {
+    await answerCallbackQuery(
+      ctx,
+      token,
+      query.id,
+      "No board user is configured for decisions (set issueInteractionActorUserId)",
+    );
+    return;
+  }
+
+  const card: InteractionCardRef = {
+    issueId: mapping.entityId,
+    companyId: mapping.companyId,
+    interactionId: callback.interactionId,
+    chatId,
+    messageId,
+  };
+
+  // Rejection that demands a reason: ask for it via force-reply and resolve on
+  // the reply (routed through the inbound `msg_` reply block in handleUpdate).
+  if (callback.action === "reject" && mapping.rejectRequiresReason) {
+    const promptMessageId = await sendMessage(
+      ctx,
+      token,
+      chatId,
+      "Reply to this message with a reason for rejecting.",
+      { forceReply: true },
+    );
+    if (promptMessageId) {
+      await ctx.state.set(
+        { scopeKind: "instance", stateKey: `msg_${chatId}_${promptMessageId}` },
+        {
+          entityId: card.issueId,
+          entityType: INTERACTION_REASON_ENTITY_TYPE,
+          companyId: card.companyId,
+          interactionId: card.interactionId,
+          cardMessageId: messageId,
+        },
+      );
+      await answerCallbackQuery(ctx, token, query.id, "Reply with a reason");
+    } else {
+      await answerCallbackQuery(ctx, token, query.id, "Could not start the reason prompt");
+    }
+    return;
+  }
+
+  await applyInteractionDecision(ctx, token, card, callback.action, actorUserId, null, actorLabel, query.id);
+}
+
 async function handleCallbackQuery(
   ctx: PluginContext,
   token: string,
   query: NonNullable<TelegramUpdate["callback_query"]>,
   baseUrl: string,
   boardApiToken?: string,
+  issueInteractionActorUserId?: string,
 ): Promise<void> {
   const data = query.data;
   if (!data) return;
@@ -1594,6 +1876,12 @@ async function handleCallbackQuery(
   // adjacent so the two approval flows are read together.
   if (isWorkflowApprovalCallback(data)) {
     await resolveWorkflowApprovalCallback(ctx, token, data, query.id, actor, messageId);
+    return;
+  }
+
+  const interactionCallback = parseInteractionCallbackData(data);
+  if (interactionCallback) {
+    await handleInteractionCallback(ctx, token, query, interactionCallback, issueInteractionActorUserId);
     return;
   }
 

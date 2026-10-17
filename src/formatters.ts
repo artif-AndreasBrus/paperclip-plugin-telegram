@@ -1,7 +1,11 @@
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
+import type { RequestConfirmationInteraction } from "@paperclipai/shared";
 import { escapeMarkdownV2, truncateAtWord } from "./telegram-api.js";
 import type { SendMessageOptions } from "./telegram-api.js";
 import { AGENT_ERROR_TRUNCATE_LENGTH } from "./constants.js";
+import {
+  buildInteractionCallbackData,
+} from "./interaction-routing.js";
 import { str } from "./coerce.js";
 
 type Payload = Record<string, unknown>;
@@ -346,6 +350,61 @@ export function formatAgentRunFinished(event: PluginEvent, opts?: IssueLinksOpts
       parseMode: "MarkdownV2",
       disableNotification: true,
       ...(buttons.length > 0 ? { inlineKeyboard: [buttons] } : {}),
+    },
+  };
+}
+
+export type InteractionIssueInfo = { identifier?: string | null; title?: string | null };
+
+// Daily decision card (issue-thread `request_confirmation`). Unlike the
+// event-based formatters above this takes the interaction object directly —
+// decision cards arrive via `ctx.issues.listInteractions`, not a PluginEvent.
+//
+// Two action buttons carry the interaction id in their `callback_data`
+// (`int_accept_`/`int_reject_` + UUID, ~47 bytes, well under Telegram's 64);
+// the callback handler recovers issue/company from the notification's stored
+// `msg_` mapping. Always loud: a decision card is something a human must act on.
+export function formatIssueInteraction(
+  interaction: RequestConfirmationInteraction,
+  issue: InteractionIssueInfo = {},
+  opts?: IssueLinksOpts,
+): FormattedMessage {
+  const payload = interaction.payload;
+  const heading = interaction.title?.trim() || "Decision needed";
+
+  const lines: string[] = [`${esc("🗳️")} ${bold(heading)}`];
+
+  const identifier = issue.identifier?.trim();
+  if (identifier) {
+    const title = issue.title?.trim();
+    lines.push(title ? `${issueLink(identifier, opts)} ${esc(title)}` : issueLink(identifier, opts));
+  }
+
+  lines.push(`\n${esc(truncateAtWord(payload.prompt, 500))}`);
+
+  const details = payload.detailsMarkdown?.trim();
+  if (details) lines.push(`\n${esc(truncateAtWord(details, 500))}`);
+
+  const acceptLabel = payload.acceptLabel?.trim() || "Approve";
+  const rejectLabel = payload.rejectLabel?.trim() || "Reject";
+
+  const keyboard: Array<Array<{ text: string; callback_data?: string; url?: string }>> = [
+    [
+      { text: `✅ ${acceptLabel}`, callback_data: buildInteractionCallbackData("accept", interaction.id) },
+      { text: `❌ ${rejectLabel}`, callback_data: buildInteractionCallbackData("reject", interaction.id) },
+    ],
+  ];
+
+  if (identifier) {
+    const btn = issueButton(identifier, opts);
+    if (btn) keyboard.push([btn]);
+  }
+
+  return {
+    text: lines.join("\n"),
+    options: {
+      parseMode: "MarkdownV2",
+      inlineKeyboard: keyboard,
     },
   };
 }
