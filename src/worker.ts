@@ -31,6 +31,9 @@ import {
 import {
   isActionableInteraction,
   parseInteractionCallbackData,
+  createRecentIssueTracker,
+  mergeInteractionCandidates,
+  type InteractionCandidate,
   INTERACTION_ENTITY_TYPE,
   INTERACTION_REASON_ENTITY_TYPE,
 } from "./interaction-routing.js";
@@ -226,6 +229,18 @@ type TelegramRuntime = {
 // behavior.
 const escalationManager = new EscalationManager();
 const issuePrefixCache = new Map<string, string>();
+
+// Issues the plugin has recently seen events for, polled by the
+// `check-issue-interactions` fallback job (see pollIssueInteractions). Bounded
+// by TTL and size inside the tracker so it never grows with the board.
+const recentIssueActivity = createRecentIssueTracker();
+
+// How wide a single fallback poll tick may reach. The owner company's
+// in-progress issues (where agents post decision cards) are a bounded page, not
+// the whole board, and the total candidate set per tick is capped so a busy
+// board cannot turn one tick into hundreds of listInteractions calls.
+const ISSUE_INTERACTION_POLL_LIST_LIMIT = 25;
+const ISSUE_INTERACTION_POLL_MAX_CANDIDATES = 40;
 const doneDedupe = makeUpdateDedupe();
 const assignmentDedupe = makeUpdateDedupe();
 const agentErrorDedupe = makeUpdateDedupe(AGENT_ERROR_DEDUPLICATION_WINDOW_MS, 1000);
@@ -451,6 +466,25 @@ function stableConfigJson(config: unknown): string {
     return value;
   };
   return JSON.stringify(normalize(config ?? null));
+}
+
+/**
+ * The secret UUID a config's bot-token reference points at, in either ref
+ * shape, or null. Used to confirm two deliveries describe the *same* install
+ * (one shared bot token) without resolving the secret.
+ */
+function botTokenSecretId(config: unknown): string | null {
+  const ref = normalizeSecretRef((config as Record<string, unknown> | null)?.telegramBotTokenRef);
+  return ref && typeof ref === "object" ? ref.secretId : null;
+}
+
+function safeParseJson(json: string | null): unknown {
+  if (!json) return null;
+  try {
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -895,6 +929,48 @@ async function checkIssueInteractions(
   }
 }
 
+/**
+ * Scheduler-poll fallback for decision cards (manifest job
+ * `check-issue-interactions`, ~1/min).
+ *
+ * The event-driven path (issue.created/issue.updated → checkIssueInteractions)
+ * misses a card posted without a *subsequent* issue.updated: issue.created
+ * fires before the card exists, and card creation need not emit a
+ * plugin-visible issue.updated. This re-lists interactions for a BOUNDED
+ * candidate set — issues recently seen in events, plus a small page of the
+ * owner's in-progress issues (where agents post cards) — never the whole board.
+ * `interaction-seen:<id>` dedupe inside checkIssueInteractions keeps this from
+ * double-sending alongside the event path.
+ */
+async function pollIssueInteractions(ctx: PluginContext, rt: TelegramRuntime): Promise<void> {
+  const tracked = recentIssueActivity.candidates();
+
+  // Secondary bounded net: a small page of the owner company's in-progress
+  // issues catches a card on an issue the plugin saw no event for at all.
+  // Best-effort — a listing failure must never starve the tracked set.
+  let listed: InteractionCandidate[] = [];
+  try {
+    const issues = await ctx.issues.list({
+      companyId: rt.companyId,
+      status: "in_progress",
+      limit: ISSUE_INTERACTION_POLL_LIST_LIMIT,
+    });
+    listed = issues
+      .filter((issue): issue is typeof issue & { id: string } => Boolean(issue?.id))
+      .map((issue) => ({ issueId: issue.id, companyId: rt.companyId }));
+  } catch (err) {
+    ctx.logger.debug("Issue-interaction poll could not list in-progress issues", {
+      companyId: rt.companyId,
+      error: String(err),
+    });
+  }
+
+  const candidates = mergeInteractionCandidates([tracked, listed], ISSUE_INTERACTION_POLL_MAX_CANDIDATES);
+  for (const candidate of candidates) {
+    await checkIssueInteractions(ctx, rt, candidate.issueId, candidate.companyId);
+  }
+}
+
 const enrichAgentName = async (ctx: PluginContext, event: PluginEvent) => {
   const payload = event.payload as Record<string, unknown>;
   if (payload.agentId && !payload.agentName) {
@@ -1074,6 +1150,9 @@ export const plugin = definePlugin({
       const rt = ensureRuntime();
       if (!rt || !rt.config.notifyOnIssueInteraction) return;
       if (!event.entityId) return;
+      // Remember this issue so the fallback job re-lists it on a later tick: a
+      // card can land after this event with no further issue.updated to catch.
+      recentIssueActivity.record(event.entityId, event.companyId);
       await checkIssueInteractions(ctx, rt, event.entityId, event.companyId);
     };
     ctx.events.on("issue.created", onIssueMaybeInteraction);
@@ -1468,6 +1547,19 @@ export const plugin = definePlugin({
       }
     });
 
+    // --- Decision-card poll fallback job ---
+    // Event-driven detection can miss a card that appears without a following
+    // issue.updated; this catches it within a tick (see pollIssueInteractions).
+    ctx.jobs.register("check-issue-interactions", async () => {
+      const rt = ensureRuntime();
+      if (!rt || !rt.config.notifyOnIssueInteraction) return;
+      try {
+        await pollIssueInteractions(ctx, rt);
+      } catch (err) {
+        ctx.logger.error("Issue-interaction poll failed", { error: String(err) });
+      }
+    });
+
     // --- Phase 5: Watch checker job ---
     ctx.jobs.register("check-watches", async () => {
       const rt = ensureRuntime();
@@ -1495,7 +1587,30 @@ export const plugin = definePlugin({
     if (!ctx) return;
 
     await queueBootstrap(async () => {
-      const companyId = await identifyDeliveredCompany(ctx, newConfig);
+      let companyId = await identifyDeliveredCompany(ctx, newConfig);
+
+      // Hot-reload hardening. A config SAVE can arrive here without a readable
+      // company scope (unlike worker start, which binds exactly one), so
+      // `identifyDeliveredCompany` returns null and the new config — e.g. a
+      // freshly-enabled notifyOnIssueInteraction — would be silently dropped
+      // until a disable→enable worker restart forced a re-read. That matches a
+      // flag-not-taking-effect symptom seen live. We already own a runtime for
+      // this install and the bot token is a single shared instance secret, so
+      // a save can only be the owner's: apply it to the owner once the
+      // delivered config carries the owner's bot token, so a stray delivery can
+      // never hot-swap the running runtime.
+      if (!companyId && ownerCompanyId) {
+        const deliveredSecretId = botTokenSecretId(newConfig);
+        const ownerSecretId = botTokenSecretId(safeParseJson(ownerConfigJson));
+        if (deliveredSecretId && ownerSecretId && deliveredSecretId === ownerSecretId) {
+          ctx.logger.info(
+            "Telegram plugin applying a configuration delivery to the current owner after attribution came back empty",
+            { ownerCompanyId },
+          );
+          companyId = ownerCompanyId;
+        }
+      }
+
       if (!companyId) {
         ctx.logger.warn(
           "Telegram plugin could not attribute a configuration delivery to a company; leaving current runtime unchanged",

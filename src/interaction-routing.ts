@@ -40,6 +40,84 @@ export type InteractionCallback = {
   interactionId: string;
 };
 
+/** An issue worth re-listing interactions for on a scheduler-poll tick. */
+export type InteractionCandidate = {
+  issueId: string;
+  companyId: string;
+};
+
+/**
+ * Bounded, time-windowed record of issues the plugin has recently seen events
+ * for, feeding the scheduler-poll fallback (worker's `check-issue-interactions`
+ * job).
+ *
+ * The event-driven path misses a decision card that is posted without a
+ * *subsequent* issue.updated: the host fires issue.created before the card
+ * exists, and card creation itself need not emit a plugin-visible issue.updated
+ * (observed live — a card only forwarded once an unrelated priority bump fired
+ * a later issue.updated). Re-listing the interactions of recently-active issues
+ * a tick later catches that gap without enumerating the whole board.
+ *
+ * Bounded two ways: entries older than `ttlMs` are dropped, and the newest
+ * `maxEntries` are kept when the map would grow past that. Re-recording an
+ * issue refreshes its timestamp so a steadily-active issue never ages out.
+ */
+export function createRecentIssueTracker(options: { ttlMs?: number; maxEntries?: number } = {}) {
+  const ttlMs = options.ttlMs ?? 10 * 60_000;
+  const maxEntries = options.maxEntries ?? 200;
+  const seen = new Map<string, { companyId: string; ts: number }>();
+
+  function prune(now: number): void {
+    for (const [issueId, rec] of seen) {
+      if (now - rec.ts >= ttlMs) seen.delete(issueId);
+    }
+    if (seen.size > maxEntries) {
+      const byAge = [...seen.entries()].sort((a, b) => a[1].ts - b[1].ts);
+      for (let i = 0; i < byAge.length - maxEntries; i++) seen.delete(byAge[i]![0]);
+    }
+  }
+
+  return {
+    record(issueId: string, companyId: string, now: number = Date.now()): void {
+      if (!issueId || !companyId) return;
+      seen.set(issueId, { companyId, ts: now });
+      prune(now);
+    },
+    candidates(now: number = Date.now()): InteractionCandidate[] {
+      prune(now);
+      return [...seen.entries()].map(([issueId, rec]) => ({ issueId, companyId: rec.companyId }));
+    },
+    get size(): number {
+      return seen.size;
+    },
+  };
+}
+
+export type RecentIssueTracker = ReturnType<typeof createRecentIssueTracker>;
+
+/**
+ * Merge candidate lists (tracked activity first, then wider nets) into a
+ * deduped, capped set. First occurrence of an issueId wins, so the
+ * higher-signal source listed first keeps its company attribution, and the
+ * result never exceeds `maxCandidates` — the bound that keeps a poll tick from
+ * fanning out across the whole board.
+ */
+export function mergeInteractionCandidates(
+  sources: InteractionCandidate[][],
+  maxCandidates: number,
+): InteractionCandidate[] {
+  const byIssue = new Map<string, InteractionCandidate>();
+  for (const list of sources) {
+    for (const candidate of list) {
+      if (!candidate.issueId || !candidate.companyId) continue;
+      if (byIssue.has(candidate.issueId)) continue;
+      byIssue.set(candidate.issueId, candidate);
+      if (byIssue.size >= maxCandidates) return [...byIssue.values()];
+    }
+  }
+  return [...byIssue.values()];
+}
+
 /** Build the Telegram `callback_data` for an accept/reject button. */
 export function buildInteractionCallbackData(
   action: "accept" | "reject",

@@ -4,6 +4,8 @@ import {
   isActionableInteraction,
   buildInteractionCallbackData,
   parseInteractionCallbackData,
+  createRecentIssueTracker,
+  mergeInteractionCandidates,
   INTERACTION_ACCEPT_PREFIX,
   INTERACTION_REJECT_PREFIX,
 } from "../src/interaction-routing.js";
@@ -72,5 +74,91 @@ describe("interaction callback_data codec", () => {
   it("uses prefixes distinct from the approval prefixes", () => {
     expect(INTERACTION_ACCEPT_PREFIX.startsWith("approve_")).toBe(false);
     expect(INTERACTION_REJECT_PREFIX.startsWith("reject_")).toBe(false);
+  });
+});
+
+describe("createRecentIssueTracker", () => {
+  it("returns recorded issues as candidates", () => {
+    const tracker = createRecentIssueTracker();
+    tracker.record("issue-a", "company-1", 1_000);
+    tracker.record("issue-b", "company-2", 1_000);
+
+    expect(tracker.candidates(1_000)).toEqual([
+      { issueId: "issue-a", companyId: "company-1" },
+      { issueId: "issue-b", companyId: "company-2" },
+    ]);
+  });
+
+  it("ignores empty issue or company ids", () => {
+    const tracker = createRecentIssueTracker();
+    tracker.record("", "company-1", 1_000);
+    tracker.record("issue-a", "", 1_000);
+    expect(tracker.size).toBe(0);
+  });
+
+  it("drops entries older than the TTL", () => {
+    const tracker = createRecentIssueTracker({ ttlMs: 5_000 });
+    tracker.record("issue-a", "company-1", 1_000);
+
+    // Still inside the window.
+    expect(tracker.candidates(5_900)).toHaveLength(1);
+    // Past the window.
+    expect(tracker.candidates(6_000)).toHaveLength(0);
+  });
+
+  it("refreshes an issue's timestamp on re-record so an active issue never ages out", () => {
+    const tracker = createRecentIssueTracker({ ttlMs: 5_000 });
+    tracker.record("issue-a", "company-1", 1_000);
+    tracker.record("issue-a", "company-1", 4_000);
+
+    // Would have expired at 6_000 on the first timestamp, but the re-record
+    // pushed it to 9_000.
+    expect(tracker.candidates(6_000)).toEqual([{ issueId: "issue-a", companyId: "company-1" }]);
+  });
+
+  it("keeps only the newest entries when it would grow past maxEntries", () => {
+    const tracker = createRecentIssueTracker({ maxEntries: 2 });
+    tracker.record("issue-a", "company-1", 1_000);
+    tracker.record("issue-b", "company-1", 2_000);
+    tracker.record("issue-c", "company-1", 3_000);
+
+    const ids = tracker.candidates(3_000).map((candidate) => candidate.issueId);
+    expect(ids).toHaveLength(2);
+    expect(ids).toContain("issue-b");
+    expect(ids).toContain("issue-c");
+    expect(ids).not.toContain("issue-a");
+  });
+});
+
+describe("mergeInteractionCandidates", () => {
+  it("dedupes by issue id, first source winning its company attribution", () => {
+    const merged = mergeInteractionCandidates(
+      [
+        [{ issueId: "issue-a", companyId: "company-1" }],
+        [
+          { issueId: "issue-a", companyId: "company-OTHER" },
+          { issueId: "issue-b", companyId: "company-2" },
+        ],
+      ],
+      10,
+    );
+
+    expect(merged).toEqual([
+      { issueId: "issue-a", companyId: "company-1" },
+      { issueId: "issue-b", companyId: "company-2" },
+    ]);
+  });
+
+  it("skips entries missing an issue or company id", () => {
+    const merged = mergeInteractionCandidates(
+      [[{ issueId: "", companyId: "c" }, { issueId: "issue-a", companyId: "" }]],
+      10,
+    );
+    expect(merged).toEqual([]);
+  });
+
+  it("never exceeds the cap", () => {
+    const many = Array.from({ length: 50 }, (_, i) => ({ issueId: `issue-${i}`, companyId: "c" }));
+    expect(mergeInteractionCandidates([many], 5)).toHaveLength(5);
   });
 });

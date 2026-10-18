@@ -99,6 +99,13 @@ const manifest: PaperclipPluginManifestV1 = {
       description: "Evaluate registered watches and send suggestions when conditions are met.",
       schedule: "*/15 * * * *",
     },
+    {
+      jobKey: "check-issue-interactions",
+      displayName: "Check Decision Cards",
+      description:
+        "Forward pending issue-thread decision cards to Telegram that the event-driven path missed (requires 'Notify on decision cards').",
+      schedule: "* * * * *",
+    },
   ],
   tools: [
     {
