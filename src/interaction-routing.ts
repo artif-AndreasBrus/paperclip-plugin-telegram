@@ -1,6 +1,8 @@
 import type {
   IssueThreadInteraction,
   RequestConfirmationInteraction,
+  AskUserQuestionsInteraction,
+  RequestItemVerdictsInteraction,
 } from "@paperclipai/shared";
 
 // Issue-thread-interaction ("decision card") Telegram wiring.
@@ -28,11 +30,41 @@ export const INTERACTION_REASON_ENTITY_TYPE = "issue_interaction_reason";
 /**
  * True when this interaction is a daily decision card the plugin can both
  * notify about and resolve from Telegram: a still-pending `request_confirmation`.
+ * `respondInteraction` is accept/reject, so this is the one kind two buttons can
+ * fully resolve.
  */
 export function isActionableInteraction(
   interaction: IssueThreadInteraction,
 ): interaction is RequestConfirmationInteraction {
   return interaction.kind === "request_confirmation" && interaction.status === "pending";
+}
+
+/**
+ * True when this is a pending decision the plugin should surface but CANNOT
+ * resolve from Telegram: `ask_user_questions` (multiple-choice answers) and
+ * `request_item_verdicts` (per-item approve/reject/defer). The plugin SDK
+ * (@paperclipai/plugin-sdk 2026.1012.0) exposes only `respondInteraction`
+ * (accept/reject) — there is no host method to submit question answers or item
+ * verdicts — so these are forwarded as notify-only cards with an "open in
+ * Paperclip" deep link rather than dropped onto the n8n digest silently.
+ */
+export function isNotifyOnlyInteraction(
+  interaction: IssueThreadInteraction,
+): interaction is AskUserQuestionsInteraction | RequestItemVerdictsInteraction {
+  return (
+    interaction.status === "pending" &&
+    (interaction.kind === "ask_user_questions" || interaction.kind === "request_item_verdicts")
+  );
+}
+
+/**
+ * Any pending interaction the plugin forwards to Telegram — actionable
+ * (accept/reject buttons) or notify-only (deep link). Other kinds
+ * (suggest_tasks, request_checkbox_confirmation, connection_intent) stay on the
+ * digest path.
+ */
+export function isForwardableInteraction(interaction: IssueThreadInteraction): boolean {
+  return isActionableInteraction(interaction) || isNotifyOnlyInteraction(interaction);
 }
 
 export type InteractionCallback = {

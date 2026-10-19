@@ -26,10 +26,13 @@ import {
   formatAgentRunStarted,
   formatAgentRunFinished,
   formatIssueInteraction,
+  formatIssueInteractionNotice,
   type IssueLinksOpts,
 } from "./formatters.js";
 import {
   isActionableInteraction,
+  isNotifyOnlyInteraction,
+  isForwardableInteraction,
   parseInteractionCallbackData,
   createRecentIssueTracker,
   mergeInteractionCandidates,
@@ -235,15 +238,28 @@ const issuePrefixCache = new Map<string, string>();
 // by TTL and size inside the tracker so it never grows with the board.
 const recentIssueActivity = createRecentIssueTracker();
 
-// How wide a single fallback poll tick may reach. The owner company's
-// in-progress issues (where agents post decision cards) are a bounded page, not
-// the whole board, and the total candidate set per tick is capped so a busy
-// board cannot turn one tick into hundreds of listInteractions calls.
-const ISSUE_INTERACTION_POLL_LIST_LIMIT = 25;
-const ISSUE_INTERACTION_POLL_MAX_CANDIDATES = 40;
+// How wide a single fallback poll tick may reach. A pending decision can sit on
+// an issue in any open status (a 36h-old backlog decision was observed live on
+// an `in_review` issue), so the poll pages a few open statuses, not just
+// in-progress — but each page is bounded and the merged candidate set is capped
+// so a busy board cannot turn one tick into hundreds of listInteractions calls.
+const ISSUE_INTERACTION_POLL_STATUSES = [
+  "in_progress",
+  "in_review",
+  "blocked",
+  "todo",
+  "backlog",
+] as const;
+const ISSUE_INTERACTION_POLL_LIST_LIMIT = 20;
+const ISSUE_INTERACTION_POLL_MAX_CANDIDATES = 60;
 const doneDedupe = makeUpdateDedupe();
 const assignmentDedupe = makeUpdateDedupe();
 const agentErrorDedupe = makeUpdateDedupe(AGENT_ERROR_DEDUPLICATION_WINDOW_MS, 1000);
+// Collapses the duplicate issue.updated events Paperclip core emits for one
+// change (and a racing poll tick) into a single send per interaction — the
+// persistent interaction-seen:<id> state is read-then-write non-atomic, so a
+// burst can all pass the seen-check before any one writes it.
+const interactionSendDedupe = makeUpdateDedupe();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -877,8 +893,8 @@ async function checkIssueInteractions(
     return;
   }
 
-  const pending = interactions.filter(isActionableInteraction);
-  if (pending.length === 0) return;
+  const forwardable = interactions.filter(isForwardableInteraction);
+  if (forwardable.length === 0) return;
 
   const chatId = await resolveChat(
     ctx,
@@ -898,27 +914,47 @@ async function checkIssueInteractions(
     if (issue) issueInfo = { identifier: issue.identifier, title: issue.title };
   } catch { /* best effort — the card still sends without the link */ }
 
-  for (const interaction of pending) {
+  for (const interaction of forwardable) {
+    // Atomic in-process claim: whichever of a duplicate-event burst (or a
+    // racing poll tick) reaches this synchronous check first wins; the rest
+    // short-circuit before the send. This closes the read-then-write race on
+    // the persistent interaction-seen:<id> state below, which on its own let
+    // concurrent duplicates all pass the seen-check and send 2–3× (observed
+    // live). The persistent flag still handles dedupe across ticks/restarts.
+    if (!interactionSendDedupe(interaction.id)) continue;
+
     const seenKey = `interaction-seen:${interaction.id}`;
     const alreadySeen = await ctx.state.get({ scopeKind: "instance", stateKey: seenKey });
     if (alreadySeen) continue;
 
-    const msg = formatIssueInteraction(interaction, issueInfo, linksOpts);
+    let msg;
+    if (isActionableInteraction(interaction)) {
+      msg = formatIssueInteraction(interaction, issueInfo, linksOpts);
+    } else if (isNotifyOnlyInteraction(interaction)) {
+      msg = formatIssueInteractionNotice(interaction, issueInfo, linksOpts);
+    } else {
+      continue; // unreachable after the isForwardableInteraction filter
+    }
     if (messageThreadId) msg.options.messageThreadId = messageThreadId;
 
     const messageId = await sendMessage(ctx, rt.token, chatId, msg.text, msg.options);
     if (!messageId) continue;
 
-    await ctx.state.set(
-      { scopeKind: "instance", stateKey: `msg_${chatId}_${messageId}` },
-      {
-        entityId: issueId,
-        entityType: INTERACTION_ENTITY_TYPE,
-        companyId,
-        interactionId: interaction.id,
-        rejectRequiresReason: Boolean(interaction.payload.rejectRequiresReason),
-      },
-    );
+    // Only actionable cards carry accept/reject buttons, so only they need the
+    // `msg_` mapping the callback/reason-reply handlers recover from. Notify-only
+    // cards have just a deep link — no callback ever hits them.
+    if (isActionableInteraction(interaction)) {
+      await ctx.state.set(
+        { scopeKind: "instance", stateKey: `msg_${chatId}_${messageId}` },
+        {
+          entityId: issueId,
+          entityType: INTERACTION_ENTITY_TYPE,
+          companyId,
+          interactionId: interaction.id,
+          rejectRequiresReason: Boolean(interaction.payload.rejectRequiresReason),
+        },
+      );
+    }
     await ctx.state.set({ scopeKind: "instance", stateKey: seenKey }, { messageId, chatId });
     await ctx.activity.log({
       companyId,
@@ -937,35 +973,44 @@ async function checkIssueInteractions(
  * misses a card posted without a *subsequent* issue.updated: issue.created
  * fires before the card exists, and card creation need not emit a
  * plugin-visible issue.updated. This re-lists interactions for a BOUNDED
- * candidate set — issues recently seen in events, plus a small page of the
- * owner's in-progress issues (where agents post cards) — never the whole board.
- * `interaction-seen:<id>` dedupe inside checkIssueInteractions keeps this from
- * double-sending alongside the event path.
+ * candidate set — issues recently seen in events, plus a small page per open
+ * status of the owner's issues (a pending decision can sit on any open status,
+ * not just in-progress) — never the whole board. `interaction-seen:<id>` dedupe
+ * inside checkIssueInteractions keeps this from double-sending alongside the
+ * event path.
  */
 async function pollIssueInteractions(ctx: PluginContext, rt: TelegramRuntime): Promise<void> {
   const tracked = recentIssueActivity.candidates();
 
-  // Secondary bounded net: a small page of the owner company's in-progress
+  // Secondary bounded net: a small page per open status of the owner company's
   // issues catches a card on an issue the plugin saw no event for at all.
-  // Best-effort — a listing failure must never starve the tracked set.
-  let listed: InteractionCandidate[] = [];
-  try {
-    const issues = await ctx.issues.list({
-      companyId: rt.companyId,
-      status: "in_progress",
-      limit: ISSUE_INTERACTION_POLL_LIST_LIMIT,
-    });
-    listed = issues
-      .filter((issue): issue is typeof issue & { id: string } => Boolean(issue?.id))
-      .map((issue) => ({ issueId: issue.id, companyId: rt.companyId }));
-  } catch (err) {
-    ctx.logger.debug("Issue-interaction poll could not list in-progress issues", {
-      companyId: rt.companyId,
-      error: String(err),
-    });
+  // Best-effort per status — a listing failure must never starve the rest.
+  const listedByStatus: InteractionCandidate[][] = [];
+  for (const status of ISSUE_INTERACTION_POLL_STATUSES) {
+    try {
+      const issues = await ctx.issues.list({
+        companyId: rt.companyId,
+        status,
+        limit: ISSUE_INTERACTION_POLL_LIST_LIMIT,
+      });
+      listedByStatus.push(
+        issues
+          .filter((issue): issue is typeof issue & { id: string } => Boolean(issue?.id))
+          .map((issue) => ({ issueId: issue.id, companyId: rt.companyId })),
+      );
+    } catch (err) {
+      ctx.logger.debug("Issue-interaction poll could not list issues", {
+        companyId: rt.companyId,
+        status,
+        error: String(err),
+      });
+    }
   }
 
-  const candidates = mergeInteractionCandidates([tracked, listed], ISSUE_INTERACTION_POLL_MAX_CANDIDATES);
+  const candidates = mergeInteractionCandidates(
+    [tracked, ...listedByStatus],
+    ISSUE_INTERACTION_POLL_MAX_CANDIDATES,
+  );
   for (const candidate of candidates) {
     await checkIssueInteractions(ctx, rt, candidate.issueId, candidate.companyId);
   }

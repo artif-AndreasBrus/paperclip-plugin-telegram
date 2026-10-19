@@ -46,6 +46,7 @@ function makeCtx(opts: {
   configByCompany?: Record<string, Record<string, unknown>>;
   interactionsByIssue?: Record<string, IssueThreadInteraction[]>;
   inProgressIssueIds?: string[];
+  issuesByStatus?: Record<string, string[]>;
 }): { ctx: PluginContext; registered: Registered } {
   const registered: Registered = { events: {}, jobs: {} };
   const companies = opts.companies ?? [];
@@ -94,7 +95,15 @@ function makeCtx(opts: {
     agents: { get: vi.fn().mockResolvedValue(null), list: vi.fn().mockResolvedValue([]) },
     issues: {
       get: vi.fn(async (issueId: string) => ({ id: issueId, identifier: "ART-1", title: "Test" })),
-      list: vi.fn(async () => (opts.inProgressIssueIds ?? []).map((id) => ({ id }))),
+      list: vi.fn(async (input: { status?: string }) => {
+        if (opts.issuesByStatus) {
+          return (opts.issuesByStatus[input.status ?? ""] ?? []).map((id) => ({ id }));
+        }
+        // Default: the whole set appears only under in_progress.
+        return input.status === "in_progress"
+          ? (opts.inProgressIssueIds ?? []).map((id) => ({ id }))
+          : [];
+      }),
       listInteractions: vi.fn(async (issueId: string) => interactionsByIssue[issueId] ?? []),
       listComments: vi.fn().mockResolvedValue([]),
     },
@@ -191,6 +200,82 @@ describe("check-issue-interactions fallback job", () => {
     await registered.jobs["check-issue-interactions"]!();
 
     expect(sentMessages).toHaveLength(1);
+  });
+
+  it("collapses duplicate concurrent issue.updated events into a single send", async () => {
+    const { plugin } = await import("../src/worker.js");
+    const { ctx, registered } = makeCtx({
+      companies: [{ id: "company-a" }],
+      configByCompany: { "company-a": INTERACTION_CONFIG },
+      interactionsByIssue: { "issue-1": [pendingCard("int-1")] },
+    });
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(INTERACTION_CONFIG);
+
+    // Paperclip core emits duplicate issue.updated events for one change; fire
+    // the same event three times concurrently.
+    const handlers = registered.events["issue.updated"] ?? [];
+    const ev = issueEvent("issue.updated", "company-a", "issue-1");
+    await Promise.all([
+      ...handlers.map((h) => h(ev)),
+      ...handlers.map((h) => h(ev)),
+      ...handlers.map((h) => h(ev)),
+    ]);
+
+    expect(sentMessages).toHaveLength(1);
+  });
+
+  it("forwards a pending card on an in_review issue via the poll (status breadth)", async () => {
+    const { plugin } = await import("../src/worker.js");
+    const { ctx, registered } = makeCtx({
+      companies: [{ id: "company-a" }],
+      configByCompany: { "company-a": INTERACTION_CONFIG },
+      interactionsByIssue: { "issue-ir": [pendingCard("int-ir")] },
+      // The issue surfaces only under in_review — never in_progress, so the
+      // old in-progress-only net would have missed it.
+      issuesByStatus: { in_review: ["issue-ir"] },
+    });
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(INTERACTION_CONFIG);
+
+    await registered.jobs["check-issue-interactions"]!();
+
+    expect(sentMessages).toHaveLength(1);
+  });
+
+  it("forwards a notify-only kind (ask_user_questions) without a resolve mapping", async () => {
+    const { plugin } = await import("../src/worker.js");
+    const questions = {
+      id: "q-1",
+      kind: "ask_user_questions",
+      status: "pending",
+      title: "Pick a path",
+      payload: {
+        version: 1,
+        questions: [
+          { id: "q1", prompt: "npm or manual?", selectionMode: "single", options: [{ id: "o1", label: "npm" }] },
+        ],
+      },
+    } as unknown as IssueThreadInteraction;
+    const { ctx, registered } = makeCtx({
+      companies: [{ id: "company-a" }],
+      configByCompany: { "company-a": INTERACTION_CONFIG },
+      interactionsByIssue: { "issue-q": [questions] },
+      issuesByStatus: { in_progress: ["issue-q"] },
+    });
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(INTERACTION_CONFIG);
+
+    await registered.jobs["check-issue-interactions"]!();
+
+    expect(sentMessages).toHaveLength(1);
+    // Notify-only cards carry no accept/reject buttons, so no `msg_` callback
+    // mapping is ever stored (only the interaction-seen dedupe key).
+    const setKeys = (ctx.state.set as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c) => (c[0] as { stateKey?: string }).stateKey ?? "",
+    );
+    expect(setKeys.some((k) => k.startsWith("msg_"))).toBe(false);
+    expect(setKeys.some((k) => k.startsWith("interaction-seen:"))).toBe(true);
   });
 
   it("no-ops when the decision-card flag is off", async () => {

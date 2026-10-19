@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { IssueThreadInteraction } from "@paperclipai/shared";
 import {
   isActionableInteraction,
+  isNotifyOnlyInteraction,
+  isForwardableInteraction,
   buildInteractionCallbackData,
   parseInteractionCallbackData,
   createRecentIssueTracker,
@@ -40,6 +42,37 @@ describe("isActionableInteraction", () => {
       "connection_intent",
     ] as const) {
       expect(isActionableInteraction(interaction({ kind } as Partial<IssueThreadInteraction>))).toBe(false);
+    }
+  });
+});
+
+describe("isNotifyOnlyInteraction / isForwardableInteraction", () => {
+  it("treats pending ask_user_questions and request_item_verdicts as notify-only", () => {
+    for (const kind of ["ask_user_questions", "request_item_verdicts"] as const) {
+      const i = interaction({ kind } as Partial<IssueThreadInteraction>);
+      expect(isNotifyOnlyInteraction(i)).toBe(true);
+      expect(isActionableInteraction(i)).toBe(false);
+      expect(isForwardableInteraction(i)).toBe(true);
+    }
+  });
+
+  it("does not treat request_confirmation as notify-only (it is actionable)", () => {
+    const i = interaction();
+    expect(isNotifyOnlyInteraction(i)).toBe(false);
+    expect(isForwardableInteraction(i)).toBe(true);
+  });
+
+  it("ignores non-pending notify-only kinds", () => {
+    expect(
+      isNotifyOnlyInteraction(
+        interaction({ kind: "ask_user_questions", status: "answered" } as Partial<IssueThreadInteraction>),
+      ),
+    ).toBe(false);
+  });
+
+  it("leaves kinds that stay on the digest unforwardable", () => {
+    for (const kind of ["suggest_tasks", "request_checkbox_confirmation", "connection_intent"] as const) {
+      expect(isForwardableInteraction(interaction({ kind } as Partial<IssueThreadInteraction>))).toBe(false);
     }
   });
 });
