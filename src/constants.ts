@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "paperclip-plugin-telegram";
-export const PLUGIN_VERSION = "0.8.2-artif.interactions.4";
+export const PLUGIN_VERSION = "0.8.2-artif.interactions.5";
 export const MAX_AGENTS_PER_THREAD = 5;
 
 export const DEFAULT_CONFIG = {

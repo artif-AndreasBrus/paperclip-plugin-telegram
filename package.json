@@ -1,6 +1,6 @@
 {
   "name": "@artif/paperclip-plugin-telegram",
-  "version": "0.8.2-artif.interactions.4",
+  "version": "0.8.2-artif.interactions.5",
   "type": "module",
   "main": "./dist/index.js",
   "paperclipPlugin": {

@@ -1,10 +1,15 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
-import { PLUGIN_ID, PLUGIN_VERSION } from "./constants.js";
+
+// Keep this file free of runtime imports. Paperclip imports the manifest with a
+// cache-busting query (mtime) on the manifest file only; anything it imports
+// (e.g. constants.js) stays in the host's ESM cache, so an upgrade would keep
+// reporting the old version until the server restarts. Must match
+// PLUGIN_ID / PLUGIN_VERSION in constants.ts (enforced by tests/manifest.test.ts).
 
 const manifest: PaperclipPluginManifestV1 = {
-  id: PLUGIN_ID,
+  id: "paperclip-plugin-telegram",
   apiVersion: 1,
-  version: PLUGIN_VERSION,
+  version: "0.8.2-artif.interactions.5",
   displayName: "Telegram Bot",
   description:
     "Bidirectional Telegram integration: push notifications, bot commands, escalation to humans, multi-agent sessions (native + ACP), media pipeline with transcription, custom workflow commands, and proactive suggestion watches.",
