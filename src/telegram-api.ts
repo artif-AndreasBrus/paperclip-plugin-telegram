@@ -127,7 +127,11 @@ export async function editMessage(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    const data = (await res.json()) as { ok: boolean };
+    const data = (await res.json()) as { ok: boolean; description?: string };
+    if (!data.ok && options.parseMode === "MarkdownV2" && !/not modified/i.test(data.description ?? "")) {
+      ctx.logger.warn("MarkdownV2 edit failed, retrying as plain text", { error: data.description });
+      return editMessage(ctx, token, chatId, messageId, stripMarkdown(text), { ...options, parseMode: undefined });
+    }
     return data.ok;
   } catch (err) {
     ctx.logger.error("Telegram editMessage failed", { error: String(err) });

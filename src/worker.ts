@@ -28,6 +28,7 @@ import {
   formatIssueInteraction,
   formatIssueInteractionNotice,
   type IssueLinksOpts,
+  formatIssueDocumentParts,
 } from "./formatters.js";
 import {
   isActionableInteraction,
@@ -39,6 +40,13 @@ import {
   type InteractionCandidate,
   INTERACTION_ENTITY_TYPE,
   INTERACTION_REASON_ENTITY_TYPE,
+  buildInteractionCallbackData,
+  buildInteractionReplyCallbackData,
+  parseInteractionReplyCallbackData,
+  interactionReplyStateKey,
+  interactionStrings,
+  type InteractionCallback,
+  type InteractionReplyCallback,
 } from "./interaction-routing.js";
 import { handleCommand, resolveNotificationThreadId, BOT_COMMANDS } from "./commands.js";
 import {
@@ -95,6 +103,8 @@ type TelegramConfig = {
   issueInteractionsChatId: string;
   issueInteractionsTopicId: string;
   issueInteractionActorUserId: string;
+  interactionLocale: string;
+  interactionDocumentKeys: string;
   notifyOnAgentError: boolean;
   notifyOnAgentRunStarted: boolean;
   notifyOnAgentRunFinished: boolean;
@@ -937,23 +947,53 @@ async function checkIssueInteractions(
     }
     if (messageThreadId) msg.options.messageThreadId = messageThreadId;
 
+    // Documents the card is about (e.g. the blog post to approve) go first, in
+    // full, so the decision can be made from Telegram without opening Paperclip.
+    if (isActionableInteraction(interaction)) {
+      for (const part of await interactionDocumentParts(ctx, rt.config, issueId, companyId, issueInfo, linksOpts)) {
+        await sendMessage(ctx, rt.token, chatId, part, {
+          parseMode: "MarkdownV2",
+          disableNotification: true,
+          ...(messageThreadId ? { messageThreadId } : {}),
+        });
+      }
+    }
+
+    // A long card arrives as several messages; the leading parts go first
+    // (silent, so the phone pings once for the card) and the last message
+    // carries the buttons, directly under the end of the text.
+    const leadingParts: string[] = "leadingParts" in msg ? (msg as { leadingParts: string[] }).leadingParts : [];
+    for (const part of leadingParts) {
+      await sendMessage(ctx, rt.token, chatId, part, {
+        parseMode: "MarkdownV2",
+        disableNotification: true,
+        ...(messageThreadId ? { messageThreadId } : {}),
+      });
+    }
+
     const messageId = await sendMessage(ctx, rt.token, chatId, msg.text, msg.options);
     if (!messageId) continue;
 
     // Only actionable cards carry accept/reject buttons, so only they need the
     // `msg_` mapping the callback/reason-reply handlers recover from. Notify-only
-    // cards have just a deep link — no callback ever hits them.
+    // cards have just a deep link — no callback ever hits them. The card text and
+    // keyboard are kept so the outcome edit can preserve what was decided and
+    // "back" can restore the buttons.
     if (isActionableInteraction(interaction)) {
-      await ctx.state.set(
-        { scopeKind: "instance", stateKey: `msg_${chatId}_${messageId}` },
-        {
-          entityId: issueId,
-          entityType: INTERACTION_ENTITY_TYPE,
-          companyId,
-          interactionId: interaction.id,
-          rejectRequiresReason: Boolean(interaction.payload.rejectRequiresReason),
-        },
-      );
+      const payload = interaction.payload;
+      const mapping: InteractionCardMapping = {
+        entityId: issueId,
+        entityType: INTERACTION_ENTITY_TYPE,
+        companyId,
+        interactionId: interaction.id,
+        rejectRequiresReason: Boolean(payload.rejectRequiresReason),
+        cardText: msg.text,
+        cardKeyboard: msg.options.inlineKeyboard,
+        acceptLabel: payload.acceptLabel?.trim() || undefined,
+        rejectLabel: payload.rejectLabel?.trim() || undefined,
+        rejectReasonLabel: payload.rejectReasonLabel?.trim() || undefined,
+      };
+      await ctx.state.set({ scopeKind: "instance", stateKey: `msg_${chatId}_${messageId}` }, mapping);
     }
     await ctx.state.set({ scopeKind: "instance", stateKey: seenKey }, { messageId, chatId });
     await ctx.activity.log({
@@ -963,6 +1003,42 @@ async function checkIssueInteractions(
       entityId: issueId,
     });
   }
+}
+
+/** Configured issue documents rendered for Telegram; best effort — a missing doc never blocks the card. */
+async function interactionDocumentParts(
+  ctx: PluginContext,
+  config: TelegramConfig,
+  issueId: string,
+  companyId: string,
+  issueInfo: { identifier?: string | null; title?: string | null },
+  linksOpts: IssueLinksOpts | undefined,
+): Promise<string[]> {
+  const keys = String(config.interactionDocumentKeys ?? "")
+    .split(",")
+    .map((k) => k.trim())
+    .filter(Boolean);
+  const de = interactionStrings(config.interactionLocale) === interactionStrings("de");
+  const parts: string[] = [];
+  for (const key of keys) {
+    try {
+      const doc = await ctx.issues.documents.get(issueId, key, companyId);
+      if (!doc?.body?.trim()) continue;
+      parts.push(
+        ...formatIssueDocumentParts(
+          { key, title: doc.title, body: doc.body },
+          issueInfo,
+          linksOpts,
+          undefined,
+          undefined,
+          de ? "… (gekürzt — vollständig in Paperclip)" : "… (truncated — full text in Paperclip)",
+        ),
+      );
+    } catch (err) {
+      ctx.logger.warn("Could not load issue document for decision card", { issueId, key, error: String(err) });
+    }
+  }
+  return parts;
 }
 
 /**
@@ -1727,7 +1803,7 @@ export async function handleUpdate(
   if (update.callback_query) {
     const companyId = await resolveCallbackCompanyId(ctx, update.callback_query);
     const boardApiToken = await resolveBoardApiToken(ctx, config, companyId);
-    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, config.issueInteractionActorUserId);
+    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, config.issueInteractionActorUserId, config.interactionLocale);
     return;
   }
 
@@ -1802,13 +1878,7 @@ export async function handleUpdate(
     const mapping = await ctx.state.get({
       scopeKind: "instance",
       stateKey: `msg_${chatId}_${replyToId}`,
-    }) as {
-      entityId: string;
-      entityType: string;
-      companyId: string;
-      interactionId?: string;
-      cardMessageId?: number;
-    } | null;
+    }) as (InteractionCardMapping & { cardMessageId?: number }) | null;
 
     if (mapping && mapping.entityType === INTERACTION_REASON_ENTITY_TYPE && mapping.interactionId) {
       // The reply carries the rejection reason captured by the force-reply
@@ -1816,11 +1886,15 @@ export async function handleUpdate(
       // the original decision message (not the prompt) to show the outcome.
       const actorUserId = config.issueInteractionActorUserId;
       const actorLabel = msg.from?.username ?? msg.from?.first_name ?? String(msg.from?.id ?? chatId);
+      const t = interactionStrings(config.interactionLocale);
       if (!actorUserId) {
-        await sendMessage(ctx, token, chatId, "No board user is configured for decisions.", {
-          replyToMessageId: msg.message_id,
-        });
+        await sendMessage(ctx, token, chatId, t.noActor, { replyToMessageId: msg.message_id });
       } else {
+        const cardMessageId = mapping.cardMessageId ?? replyToId;
+        const cardMapping = (await ctx.state.get({
+          scopeKind: "instance",
+          stateKey: `msg_${chatId}_${cardMessageId}`,
+        })) as InteractionCardMapping | null;
         await applyInteractionDecision(
           ctx,
           token,
@@ -1829,14 +1903,21 @@ export async function handleUpdate(
             companyId: mapping.companyId,
             interactionId: mapping.interactionId,
             chatId,
-            messageId: mapping.cardMessageId ?? replyToId,
+            messageId: cardMessageId,
+            mapping: cardMapping,
           },
           "reject",
           actorUserId,
           text,
           actorLabel,
+          config.interactionLocale,
         );
       }
+    } else if (mapping && mapping.entityType === INTERACTION_ENTITY_TYPE && mapping.interactionId) {
+      // A free-text reply straight to a decision card (no button pressed).
+      // Ambiguous on its own — a rejection reason, a change request, or just a
+      // remark — so ask once instead of guessing on an approval.
+      await offerInteractionReplyChoice(ctx, token, config, chatId, replyToId, mapping, text, msg.message_id);
     } else if (mapping && mapping.entityType === "escalation") {
       const escalationManager = new EscalationManager();
       const responderId = `telegram:${msg.from?.username ?? msg.from?.id ?? chatId}`;
@@ -1872,13 +1953,56 @@ export async function handleUpdate(
   }
 }
 
+/** What the plugin stores under `msg_<chat>_<cardMessageId>` for a decision card. */
+type InteractionCardMapping = {
+  entityId: string;
+  entityType: string;
+  companyId: string;
+  interactionId?: string;
+  rejectRequiresReason?: boolean;
+  /** The card message's MarkdownV2 text, kept so the outcome edit preserves it. */
+  cardText?: string;
+  cardKeyboard?: Array<Array<{ text: string; callback_data?: string; url?: string }>>;
+  acceptLabel?: string;
+  rejectLabel?: string;
+  rejectReasonLabel?: string;
+};
+
 type InteractionCardRef = {
   issueId: string;
   companyId: string;
   interactionId: string;
   chatId: string;
   messageId: number;
+  mapping?: InteractionCardMapping | null;
 };
+
+/** Pending free-text reply to a card, waiting for the user to choose reject/comment/discard. */
+type PendingInteractionReply = {
+  text: string;
+  cardMessageId: number;
+  replyMessageId: number;
+  issueId: string;
+  companyId: string;
+  interactionId: string;
+};
+
+const TELEGRAM_TEXT_MAX = 4096;
+
+/**
+ * Card text with an outcome line appended — the decided content stays readable
+ * in the chat history instead of being replaced by "Rejected by …". Falls back
+ * to the outcome alone for cards sent before the text was stored.
+ */
+function withOutcome(cardText: string | undefined, outcome: string): string {
+  if (!cardText) return outcome;
+  const sep = "\n\n";
+  const room = TELEGRAM_TEXT_MAX - outcome.length - sep.length - 8;
+  if (cardText.length <= room) return `${cardText}${sep}${outcome}`;
+  let cut = room;
+  if (cardText[cut - 1] === "\\") cut -= 1;
+  return `${cardText.slice(0, cut)}${escapeMarkdownV2("…")}${sep}${outcome}`;
+}
 
 /**
  * Resolve (accept/reject) a decision card and report the outcome.
@@ -1897,8 +2021,10 @@ async function applyInteractionDecision(
   actorUserId: string,
   reason: string | null,
   actorLabel: string,
+  locale?: string,
   callbackQueryId?: string,
-): Promise<void> {
+): Promise<boolean> {
+  const t = interactionStrings(locale);
   try {
     const { applied } = await ctx.issues.respondInteraction(
       card.issueId,
@@ -1908,13 +2034,18 @@ async function applyInteractionDecision(
     );
 
     const icon = action === "accept" ? "✅" : "❌";
-    const verb = action === "accept" ? "Approved" : "Rejected";
-    const suffix = applied ? "" : " (already resolved)";
-    let body = `${escapeMarkdownV2(icon)} *${escapeMarkdownV2(verb + suffix)}* by ${escapeMarkdownV2(actorLabel)}`;
-    if (reason) body += `\n${escapeMarkdownV2(`Reason: ${reason}`)}`;
+    const label =
+      action === "accept"
+        ? card.mapping?.acceptLabel || "Approved"
+        : card.mapping?.rejectLabel || "Rejected";
+    const suffix = applied ? "" : ` (${t.alreadyResolved})`;
+    let outcome = `${escapeMarkdownV2(icon)} *${escapeMarkdownV2(label + suffix)}* ${escapeMarkdownV2(`${t.by} ${actorLabel}`)}`;
+    if (reason) outcome += `\n${escapeMarkdownV2(`${t.reasonPrefix}: ${reason}`)}`;
 
-    await editMessage(ctx, token, card.chatId, card.messageId, body, { parseMode: "MarkdownV2" });
-    if (callbackQueryId) await answerCallbackQuery(ctx, token, callbackQueryId, `${verb}${suffix}`);
+    await editMessage(ctx, token, card.chatId, card.messageId, withOutcome(card.mapping?.cardText, outcome), {
+      parseMode: "MarkdownV2",
+    });
+    if (callbackQueryId) await answerCallbackQuery(ctx, token, callbackQueryId, `${label}${suffix}`);
     if (applied) await ctx.metrics.write(METRIC_NAMES.interactionsResolved, 1);
 
     ctx.logger.info("Resolved issue-thread interaction from Telegram", {
@@ -1924,13 +2055,16 @@ async function applyInteractionDecision(
       applied,
       actor: actorLabel,
     });
+    return true;
   } catch (err) {
     ctx.logger.error("Failed to resolve issue-thread interaction", {
       interactionId: card.interactionId,
       action,
       error: String(err),
     });
-    if (callbackQueryId) await answerCallbackQuery(ctx, token, callbackQueryId, `Failed: ${String(err)}`);
+    if (callbackQueryId) await answerCallbackQuery(ctx, token, callbackQueryId, `${t.failed}: ${String(err)}`);
+    else await sendMessage(ctx, token, card.chatId, `${t.failed}: ${String(err)}`, { replyToMessageId: card.messageId });
+    return false;
   }
 }
 
@@ -1938,42 +2072,37 @@ async function handleInteractionCallback(
   ctx: PluginContext,
   token: string,
   query: NonNullable<TelegramUpdate["callback_query"]>,
-  callback: { action: "accept" | "reject"; interactionId: string },
+  callback: InteractionCallback,
   actorUserId?: string,
+  locale?: string,
 ): Promise<void> {
+  const t = interactionStrings(locale);
   const chatId = query.message?.chat.id ? String(query.message.chat.id) : null;
   const messageId = query.message?.message_id;
   const actorLabel = query.from.username ?? query.from.first_name ?? String(query.from.id);
 
   if (!chatId || !messageId) {
-    await answerCallbackQuery(ctx, token, query.id, "This decision is no longer available");
+    await answerCallbackQuery(ctx, token, query.id, t.noLongerAvailable);
     return;
   }
 
   const mapping = (await ctx.state.get({
     scopeKind: "instance",
     stateKey: `msg_${chatId}_${messageId}`,
-  })) as
-    | { entityId: string; entityType: string; companyId: string; interactionId?: string; rejectRequiresReason?: boolean }
-    | null;
+  })) as InteractionCardMapping | null;
 
   if (
     !mapping ||
     mapping.entityType !== INTERACTION_ENTITY_TYPE ||
     mapping.interactionId !== callback.interactionId
   ) {
-    await answerCallbackQuery(ctx, token, query.id, "This decision is no longer available");
+    await answerCallbackQuery(ctx, token, query.id, t.noLongerAvailable);
     return;
   }
 
   // Responding resolves the card in a human's name — never guess the identity.
   if (!actorUserId) {
-    await answerCallbackQuery(
-      ctx,
-      token,
-      query.id,
-      "No board user is configured for decisions (set issueInteractionActorUserId)",
-    );
+    await answerCallbackQuery(ctx, token, query.id, t.noActor);
     return;
   }
 
@@ -1983,37 +2112,193 @@ async function handleInteractionCallback(
     interactionId: callback.interactionId,
     chatId,
     messageId,
+    mapping,
   };
 
-  // Rejection that demands a reason: ask for it via force-reply and resolve on
-  // the reply (routed through the inbound `msg_` reply block in handleUpdate).
-  if (callback.action === "reject" && mapping.rejectRequiresReason) {
-    const promptMessageId = await sendMessage(
+  if (callback.action === "back") {
+    // Cancel a started rejection: put the original buttons back.
+    if (mapping.cardText && mapping.cardKeyboard) {
+      await editMessage(ctx, token, chatId, messageId, mapping.cardText, {
+        parseMode: "MarkdownV2",
+        inlineKeyboard: mapping.cardKeyboard,
+      });
+    }
+    await answerCallbackQuery(ctx, token, query.id, "↩️");
+    return;
+  }
+
+  if (callback.action === "reject_now") {
+    await applyInteractionDecision(ctx, token, card, "reject", actorUserId, null, actorLabel, locale, query.id);
+    return;
+  }
+
+  // Rejection: ask for a reason via force-reply and resolve on the reply
+  // (routed through the inbound `msg_` reply block in handleUpdate). A required
+  // reason gets the prompt only; an optional one additionally swaps the card's
+  // buttons to "reject without reason" / "back".
+  if (callback.action === "reject") {
+    const label = mapping.rejectReasonLabel || mapping.rejectLabel || "";
+    const promptText = mapping.rejectRequiresReason
+      ? t.reasonPromptRequired(label).trim()
+      : t.reasonPromptOptional(label).trim();
+    const promptMessageId = await sendMessage(ctx, token, chatId, promptText, {
+      forceReply: true,
+      replyToMessageId: messageId,
+    });
+    if (!promptMessageId) {
+      await answerCallbackQuery(ctx, token, query.id, t.failed);
+      return;
+    }
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `msg_${chatId}_${promptMessageId}` },
+      {
+        entityId: card.issueId,
+        entityType: INTERACTION_REASON_ENTITY_TYPE,
+        companyId: card.companyId,
+        interactionId: card.interactionId,
+        cardMessageId: messageId,
+      },
+    );
+    if (!mapping.rejectRequiresReason && mapping.cardText) {
+      const linkRows = (mapping.cardKeyboard ?? []).filter((row) => row.every((b) => b.url));
+      await editMessage(ctx, token, chatId, messageId, mapping.cardText, {
+        parseMode: "MarkdownV2",
+        inlineKeyboard: [
+          [
+            { text: t.rejectWithoutReason, callback_data: buildInteractionCallbackData("reject_now", card.interactionId) },
+            { text: t.back, callback_data: buildInteractionCallbackData("back", card.interactionId) },
+          ],
+          ...linkRows,
+        ],
+      });
+    }
+    await answerCallbackQuery(ctx, token, query.id, t.answerReply);
+    return;
+  }
+
+  await applyInteractionDecision(ctx, token, card, "accept", actorUserId, null, actorLabel, locale, query.id);
+}
+
+/**
+ * A plain reply to a decision card: store the text and ask what it is —
+ * rejection reason, comment on the issue (as the board user, which wakes the
+ * assignee and, for `supersedeOnUserComment` cards, supersedes the card), or
+ * nothing.
+ */
+async function offerInteractionReplyChoice(
+  ctx: PluginContext,
+  token: string,
+  config: TelegramConfig,
+  chatId: string,
+  cardMessageId: number,
+  mapping: InteractionCardMapping,
+  text: string,
+  replyMessageId: number,
+): Promise<void> {
+  const t = interactionStrings(config.interactionLocale);
+  const choiceMessageId = await sendMessage(ctx, token, chatId, t.replyChoice, {
+    replyToMessageId: replyMessageId,
+  });
+  if (!choiceMessageId) return;
+  const pending: PendingInteractionReply = {
+    text,
+    cardMessageId,
+    replyMessageId,
+    issueId: mapping.entityId,
+    companyId: mapping.companyId,
+    interactionId: mapping.interactionId!,
+  };
+  await ctx.state.set({ scopeKind: "instance", stateKey: interactionReplyStateKey(chatId, choiceMessageId) }, pending);
+  await editMessage(ctx, token, chatId, choiceMessageId, t.replyChoice, {
+    inlineKeyboard: [
+      [{ text: t.replyReject(mapping.rejectLabel || "Reject"), callback_data: buildInteractionReplyCallbackData("reply_reject", choiceMessageId) }],
+      [{ text: t.replyComment, callback_data: buildInteractionReplyCallbackData("reply_comment", choiceMessageId) }],
+      [{ text: t.replyDiscard, callback_data: buildInteractionReplyCallbackData("reply_discard", choiceMessageId) }],
+    ],
+  });
+}
+
+async function handleInteractionReplyCallback(
+  ctx: PluginContext,
+  token: string,
+  query: NonNullable<TelegramUpdate["callback_query"]>,
+  callback: InteractionReplyCallback,
+  actorUserId?: string,
+  locale?: string,
+): Promise<void> {
+  const t = interactionStrings(locale);
+  const chatId = query.message?.chat.id ? String(query.message.chat.id) : null;
+  const actorLabel = query.from.username ?? query.from.first_name ?? String(query.from.id);
+  if (!chatId || query.message?.message_id !== callback.choiceMessageId) {
+    await answerCallbackQuery(ctx, token, query.id, t.noLongerAvailable);
+    return;
+  }
+  const stateKey = { scopeKind: "instance" as const, stateKey: interactionReplyStateKey(chatId, callback.choiceMessageId) };
+  const pending = (await ctx.state.get(stateKey)) as PendingInteractionReply | null;
+  if (!pending) {
+    await answerCallbackQuery(ctx, token, query.id, t.noLongerAvailable);
+    return;
+  }
+
+  if (callback.action === "reply_discard") {
+    await ctx.state.delete(stateKey);
+    await editMessage(ctx, token, chatId, callback.choiceMessageId, t.discarded);
+    await answerCallbackQuery(ctx, token, query.id, t.discarded);
+    return;
+  }
+
+  if (!actorUserId) {
+    await answerCallbackQuery(ctx, token, query.id, t.noActor);
+    return;
+  }
+
+  const cardMapping = (await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: `msg_${chatId}_${pending.cardMessageId}`,
+  })) as InteractionCardMapping | null;
+
+  if (callback.action === "reply_reject") {
+    const ok = await applyInteractionDecision(
       ctx,
       token,
-      chatId,
-      "Reply to this message with a reason for rejecting.",
-      { forceReply: true },
+      {
+        issueId: pending.issueId,
+        companyId: pending.companyId,
+        interactionId: pending.interactionId,
+        chatId,
+        messageId: pending.cardMessageId,
+        mapping: cardMapping,
+      },
+      "reject",
+      actorUserId,
+      pending.text,
+      actorLabel,
+      locale,
+      query.id,
     );
-    if (promptMessageId) {
-      await ctx.state.set(
-        { scopeKind: "instance", stateKey: `msg_${chatId}_${promptMessageId}` },
-        {
-          entityId: card.issueId,
-          entityType: INTERACTION_REASON_ENTITY_TYPE,
-          companyId: card.companyId,
-          interactionId: card.interactionId,
-          cardMessageId: messageId,
-        },
-      );
-      await answerCallbackQuery(ctx, token, query.id, "Reply with a reason");
-    } else {
-      await answerCallbackQuery(ctx, token, query.id, "Could not start the reason prompt");
+    if (ok) {
+      await ctx.state.delete(stateKey);
+      await editMessage(ctx, token, chatId, callback.choiceMessageId, t.replyReject(cardMapping?.rejectLabel || "Reject"));
     }
     return;
   }
 
-  await applyInteractionDecision(ctx, token, card, callback.action, actorUserId, null, actorLabel, query.id);
+  // reply_comment: post as the board user (human-attributed), like a comment in
+  // the web app. The card itself stays as it is — the host decides whether the
+  // comment supersedes it (`supersedeOnUserComment`).
+  try {
+    await ctx.issues.createComment(pending.issueId, pending.text, pending.companyId, { actorUserId });
+    await ctx.state.delete(stateKey);
+    await editMessage(ctx, token, chatId, callback.choiceMessageId, t.commentSent);
+    await answerCallbackQuery(ctx, token, query.id, t.commentNote);
+    await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+  } catch (err) {
+    ctx.logger.error("Failed to post decision-card reply as comment", {
+      issueId: pending.issueId,
+      error: String(err),
+    });
+    await answerCallbackQuery(ctx, token, query.id, `${t.failed}: ${String(err)}`);
+  }
 }
 
 async function handleCallbackQuery(
@@ -2023,6 +2308,7 @@ async function handleCallbackQuery(
   baseUrl: string,
   boardApiToken?: string,
   issueInteractionActorUserId?: string,
+  interactionLocale?: string,
 ): Promise<void> {
   const data = query.data;
   if (!data) return;
@@ -2041,7 +2327,13 @@ async function handleCallbackQuery(
 
   const interactionCallback = parseInteractionCallbackData(data);
   if (interactionCallback) {
-    await handleInteractionCallback(ctx, token, query, interactionCallback, issueInteractionActorUserId);
+    await handleInteractionCallback(ctx, token, query, interactionCallback, issueInteractionActorUserId, interactionLocale);
+    return;
+  }
+
+  const interactionReplyCallback = parseInteractionReplyCallbackData(data);
+  if (interactionReplyCallback) {
+    await handleInteractionReplyCallback(ctx, token, query, interactionReplyCallback, issueInteractionActorUserId, interactionLocale);
     return;
   }
 

@@ -18,6 +18,16 @@ import type {
 
 export const INTERACTION_ACCEPT_PREFIX = "int_accept_";
 export const INTERACTION_REJECT_PREFIX = "int_reject_";
+export const INTERACTION_REJECT_NOW_PREFIX = "int_rnow_";
+export const INTERACTION_BACK_PREFIX = "int_back_";
+export const INTERACTION_REPLY_REJECT_PREFIX = "int_rr_";
+export const INTERACTION_REPLY_COMMENT_PREFIX = "int_rc_";
+export const INTERACTION_REPLY_DISCARD_PREFIX = "int_rd_";
+
+/** State key holding a free-text reply to a card until the user picks what to do with it. */
+export function interactionReplyStateKey(chatId: string, choiceMessageId: number): string {
+  return `intreply_${chatId}_${choiceMessageId}`;
+}
 
 /**
  * State entityType stored on an interaction notification's `msg_<chat>_<id>`
@@ -67,9 +77,21 @@ export function isForwardableInteraction(interaction: IssueThreadInteraction): b
   return isActionableInteraction(interaction) || isNotifyOnlyInteraction(interaction);
 }
 
+/**
+ * accept/reject — the card's two main buttons.
+ * reject_now — "reject without a reason" (shown while an optional reason is asked for).
+ * back — restore the card's original buttons (cancel a started rejection).
+ */
 export type InteractionCallback = {
-  action: "accept" | "reject";
+  action: "accept" | "reject" | "reject_now" | "back";
   interactionId: string;
+};
+
+/** Choice offered after a free-text reply to a card: reject with it, post it as comment, discard. */
+export type InteractionReplyCallback = {
+  action: "reply_reject" | "reply_comment" | "reply_discard";
+  /** message_id of the bot's choice message, which keys the pending reply state. */
+  choiceMessageId: number;
 };
 
 /** An issue worth re-listing interactions for on a scheduler-poll tick. */
@@ -150,29 +172,127 @@ export function mergeInteractionCandidates(
   return [...byIssue.values()];
 }
 
-/** Build the Telegram `callback_data` for an accept/reject button. */
+const CALLBACK_PREFIXES: Array<[InteractionCallback["action"], string]> = [
+  ["accept", INTERACTION_ACCEPT_PREFIX],
+  ["reject", INTERACTION_REJECT_PREFIX],
+  ["reject_now", INTERACTION_REJECT_NOW_PREFIX],
+  ["back", INTERACTION_BACK_PREFIX],
+];
+
+const REPLY_PREFIXES: Array<[InteractionReplyCallback["action"], string]> = [
+  ["reply_reject", INTERACTION_REPLY_REJECT_PREFIX],
+  ["reply_comment", INTERACTION_REPLY_COMMENT_PREFIX],
+  ["reply_discard", INTERACTION_REPLY_DISCARD_PREFIX],
+];
+
+/** Build the Telegram `callback_data` for a decision-card button. */
 export function buildInteractionCallbackData(
-  action: "accept" | "reject",
+  action: InteractionCallback["action"],
   interactionId: string,
 ): string {
-  const prefix = action === "accept" ? INTERACTION_ACCEPT_PREFIX : INTERACTION_REJECT_PREFIX;
+  const prefix = CALLBACK_PREFIXES.find(([a]) => a === action)![1];
   return `${prefix}${interactionId}`;
 }
 
 /**
  * Parse an interaction `callback_data`, or null when it is not one of ours.
- * Reject is checked first so the accept prefix (a strict substring of neither)
- * cannot shadow it; both prefixes are disjoint from the approval/escalation
- * prefixes handled elsewhere.
+ * All prefixes are pairwise non-overlapping ("int_reject_" vs "int_rnow_" …)
+ * and disjoint from the approval/escalation prefixes handled elsewhere.
  */
 export function parseInteractionCallbackData(data: string): InteractionCallback | null {
-  if (data.startsWith(INTERACTION_ACCEPT_PREFIX)) {
-    const interactionId = data.slice(INTERACTION_ACCEPT_PREFIX.length);
-    return interactionId ? { action: "accept", interactionId } : null;
-  }
-  if (data.startsWith(INTERACTION_REJECT_PREFIX)) {
-    const interactionId = data.slice(INTERACTION_REJECT_PREFIX.length);
-    return interactionId ? { action: "reject", interactionId } : null;
+  for (const [action, prefix] of CALLBACK_PREFIXES) {
+    if (data.startsWith(prefix)) {
+      const interactionId = data.slice(prefix.length);
+      return interactionId ? { action, interactionId } : null;
+    }
   }
   return null;
+}
+
+export function buildInteractionReplyCallbackData(
+  action: InteractionReplyCallback["action"],
+  choiceMessageId: number,
+): string {
+  const prefix = REPLY_PREFIXES.find(([a]) => a === action)![1];
+  return `${prefix}${choiceMessageId}`;
+}
+
+export function parseInteractionReplyCallbackData(data: string): InteractionReplyCallback | null {
+  for (const [action, prefix] of REPLY_PREFIXES) {
+    if (data.startsWith(prefix)) {
+      const choiceMessageId = Number(data.slice(prefix.length));
+      return Number.isInteger(choiceMessageId) && choiceMessageId > 0 ? { action, choiceMessageId } : null;
+    }
+  }
+  return null;
+}
+
+type InteractionStrings = {
+  reasonPromptRequired: (label: string) => string;
+  reasonPromptOptional: (label: string) => string;
+  rejectWithoutReason: string;
+  back: string;
+  replyChoice: string;
+  replyReject: (rejectLabel: string) => string;
+  replyComment: string;
+  replyDiscard: string;
+  commentSent: string;
+  commentNote: string;
+  discarded: string;
+  noActor: string;
+  noLongerAvailable: string;
+  alreadyResolved: string;
+  reasonPrefix: string;
+  by: string;
+  answerReply: string;
+  failed: string;
+};
+
+const STRINGS: Record<"en" | "de", InteractionStrings> = {
+  en: {
+    reasonPromptRequired: (l) => `✍️ ${l}\nReply to this message with your reason.`,
+    reasonPromptOptional: (l) =>
+      `✍️ ${l}\nReply to this message with a reason or a change request — or reject without one using the button on the card.`,
+    rejectWithoutReason: "❌ Reject without reason",
+    back: "↩️ Back",
+    replyChoice: "What should happen with your reply?",
+    replyReject: (l) => `❌ ${l} with this reason`,
+    replyComment: "💬 Post as comment only",
+    replyDiscard: "✖️ Discard",
+    commentSent: "💬 Posted as a comment on the issue.",
+    commentNote: "💬 Comment posted",
+    discarded: "✖️ Discarded.",
+    noActor: "No board user is configured for decisions (set issueInteractionActorUserId)",
+    noLongerAvailable: "This decision is no longer available",
+    alreadyResolved: "already resolved",
+    reasonPrefix: "Reason",
+    by: "by",
+    answerReply: "Reply with a reason",
+    failed: "Failed",
+  },
+  de: {
+    reasonPromptRequired: (l) => `✍️ ${l}\nBitte auf diese Nachricht mit deiner Begründung antworten.`,
+    reasonPromptOptional: (l) =>
+      `✍️ ${l}\nAuf diese Nachricht mit Begründung oder Änderungswunsch antworten — oder auf der Karte „ohne Begründung“ ablehnen.`,
+    rejectWithoutReason: "❌ Ohne Begründung ablehnen",
+    back: "↩️ Zurück",
+    replyChoice: "Was soll mit deiner Antwort passieren?",
+    replyReject: (l) => `❌ ${l} mit dieser Begründung`,
+    replyComment: "💬 Nur als Kommentar senden",
+    replyDiscard: "✖️ Verwerfen",
+    commentSent: "💬 Als Kommentar ans Issue gesendet.",
+    commentNote: "💬 Kommentar gesendet",
+    discarded: "✖️ Verworfen.",
+    noActor: "Kein Board-User für Entscheidungen konfiguriert (issueInteractionActorUserId)",
+    noLongerAvailable: "Diese Entscheidung ist nicht mehr verfügbar",
+    alreadyResolved: "war bereits entschieden",
+    reasonPrefix: "Begründung",
+    by: "von",
+    answerReply: "Bitte Begründung als Antwort schreiben",
+    failed: "Fehlgeschlagen",
+  },
+};
+
+export function interactionStrings(locale?: string): InteractionStrings {
+  return locale?.toLowerCase().startsWith("de") ? STRINGS.de : STRINGS.en;
 }

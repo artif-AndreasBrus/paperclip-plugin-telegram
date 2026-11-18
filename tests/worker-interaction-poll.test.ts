@@ -356,3 +356,52 @@ describe("onConfigChanged hot-reload hardening", () => {
     );
   });
 });
+
+describe("issue document attached to a decision card", () => {
+  it("sends the configured document in full before the card", async () => {
+    const { plugin } = await import("../src/worker.js");
+    const config = { ...INTERACTION_CONFIG, interactionDocumentKeys: "beitrag, fehlt" };
+    const { ctx, registered } = makeCtx({
+      companies: [{ id: "company-a" }],
+      configByCompany: { "company-a": config },
+      interactionsByIssue: { "issue-1": [pendingCard("int-1")] },
+    });
+    const longBody = "---\nslug: x\n---\n# Überschrift\n\n" +
+      Array.from({ length: 12 }, (_, i) => `Absatz ${i} ` + "z".repeat(500)).join("\n\n");
+    const get = vi.fn(async (_issueId: string, key: string) =>
+      key === "beitrag" ? { key, title: "Mein Beitrag", body: longBody } : null,
+    );
+    (ctx.issues as unknown as { documents: unknown }).documents = { get };
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(config);
+
+    await emit(registered, "issue.updated", issueEvent("issue.updated", "company-a", "issue-1"));
+
+    expect(get).toHaveBeenCalledWith("issue-1", "beitrag", "company-a");
+    expect(sentMessages.length).toBeGreaterThanOrEqual(3);
+    const docParts = sentMessages.slice(0, -1);
+    expect(docParts.every((m) => m.text.includes("Mein Beitrag"))).toBe(true);
+    expect(docParts.map((m) => m.text).join("\n")).toContain("Absatz 11");
+    expect(docParts[0]!.text).not.toContain("slug");
+    expect(sentMessages.at(-1)!.text).toContain("Ship it?");
+  });
+
+  it("still sends the card when the document cannot be loaded", async () => {
+    const { plugin } = await import("../src/worker.js");
+    const config = { ...INTERACTION_CONFIG, interactionDocumentKeys: "beitrag" };
+    const { ctx, registered } = makeCtx({
+      companies: [{ id: "company-a" }],
+      configByCompany: { "company-a": config },
+      interactionsByIssue: { "issue-1": [pendingCard("int-1")] },
+    });
+    (ctx.issues as unknown as { documents: unknown }).documents = {
+      get: vi.fn().mockRejectedValue(new Error("boom")),
+    };
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(config);
+
+    await emit(registered, "issue.updated", issueEvent("issue.updated", "company-a", "issue-1"));
+    expect(sentMessages).toHaveLength(1);
+    expect(sentMessages[0]!.text).toContain("Ship it?");
+  });
+});

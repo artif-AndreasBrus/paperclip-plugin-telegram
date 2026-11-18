@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "paperclip-plugin-telegram";
-export const PLUGIN_VERSION = "0.8.2-artif.interactions.3";
+export const PLUGIN_VERSION = "0.8.2-artif.interactions.4";
 export const MAX_AGENTS_PER_THREAD = 5;
 
 export const DEFAULT_CONFIG = {
@@ -29,6 +29,12 @@ export const DEFAULT_CONFIG = {
   // re-verifies this is an active human member before applying. Empty disables
   // the action buttons (notifications still send).
   issueInteractionActorUserId: "",
+  // Language of the plugin's own decision-card hints ("en" | "de"). The card's
+  // own labels (accept/reject/reason) always come from the card payload.
+  interactionLocale: "en",
+  // Comma-separated issue-document keys (e.g. "beitrag") whose body is sent
+  // in full right before a decision card on that issue. Empty = off.
+  interactionDocumentKeys: "",
   notifyOnAgentError: true,
   notifyOnAgentRunStarted: false,
   notifyOnAgentRunFinished: false,
